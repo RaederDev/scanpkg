@@ -21,7 +21,7 @@ OPENAI_REASONING_EFFORT="${OPENAI_REASONING_EFFORT:-medium}"
 OPENAI_STORE="${OPENAI_STORE:-false}"
 
 RISK_ABORT_THRESHOLD="${RISK_ABORT_THRESHOLD:-2}"
-CRITICAL_RISK_KEYS="${CRITICAL_RISK_KEYS:-malware_suspected credential_exfiltration destructive_behavior obfuscated_payload install_script_suspicious}"
+CRITICAL_RISK_KEYS="${CRITICAL_RISK_KEYS:-malware_suspected credential_exfiltration destructive_behavior obfuscated_payload install_script_suspicious new_runtime_or_toolchain}"
 SCANPKG_ALLOW_FAILED_PACKAGES="${SCANPKG_ALLOW_FAILED_PACKAGES:-}"
 FAIL_CLOSED="${FAIL_CLOSED:-1}"
 
