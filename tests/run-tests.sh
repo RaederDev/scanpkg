@@ -43,6 +43,8 @@ make_verdict() {
     --argjson install_suspicious "${7:-false}" \
     --argjson author "${8:-false}" \
     --argjson checksum "${9:-false}" \
+    --argjson hook "${10:-false}" \
+    --argjson sidecar "${11:-false}" \
     '{
       malware_suspected: $malware,
       credential_exfiltration: $credential,
@@ -51,6 +53,8 @@ make_verdict() {
       new_runtime_or_toolchain: $runtime,
       new_install_script: $new_install,
       install_script_suspicious: $install_suspicious,
+      package_hook_suspicious: $hook,
+      sidecar_file_suspicious: $sidecar,
       new_or_unusual_author: $author,
       checksum_or_source_suspicious: $checksum,
       summary: "fixture verdict",
@@ -241,7 +245,7 @@ test_single_noncritical_allows() {
   local dir="$TEST_ROOT/single"
   setup_case "$dir"
   write_pkgbuild "$dir" 'pkgname=single'
-  write_openai_response "$(make_verdict false false false false true)" "$dir/response.json"
+  write_openai_response "$(make_verdict false false false false false true)" "$dir/response.json"
 
   OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null
   [[ -f "$dir/makepkg.args" ]]
@@ -293,6 +297,60 @@ test_missing_install_warning() {
   jq -e '.input[].content | select(contains("Missing install script: missing.install") and contains("WARNING"))' "$dir/payload.json" >/dev/null
 }
 
+test_variable_install_in_payload() {
+  local dir="$TEST_ROOT/install-variable"
+  setup_case "$dir"
+  write_pkgbuild "$dir" "pkgname=resolved"$'\n'"install=\$pkgname.install"
+  printf '%s\n' 'post_upgrade() { echo resolved; }' > "$dir/resolved.install"
+  write_openai_response "$(make_verdict)" "$dir/response.json"
+
+  OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null
+  jq -e '.input[].content | select(contains("Install script: resolved.install") and contains("post_upgrade"))' "$dir/payload.json" >/dev/null
+}
+
+test_changelog_in_payload() {
+  local dir="$TEST_ROOT/changelog"
+  setup_case "$dir"
+  write_pkgbuild "$dir" "pkgname=changelog"$'\n'"changelog=NEWS"
+  printf '%s\n' 'security relevant packaging note' > "$dir/NEWS"
+  write_openai_response "$(make_verdict)" "$dir/response.json"
+
+  OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null
+  jq -e '.input[].content | select(contains("Package sidecar file (changelog): NEWS") and contains("security relevant packaging note"))' "$dir/payload.json" >/dev/null
+}
+
+test_missing_changelog_warning() {
+  local dir="$TEST_ROOT/changelog-missing"
+  setup_case "$dir"
+  write_pkgbuild "$dir" "pkgname=changelog-missing"$'\n'"changelog=missing.NEWS"
+  write_openai_response "$(make_verdict)" "$dir/response.json"
+
+  OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null
+  jq -e '.input[].content | select(contains("Missing package sidecar file (changelog): missing.NEWS") and contains("WARNING"))' "$dir/payload.json" >/dev/null
+}
+
+test_local_source_patch_in_payload() {
+  local dir="$TEST_ROOT/source-patch"
+  setup_case "$dir"
+  write_pkgbuild "$dir" "pkgname=source-patch"$'\n'"source=("$'\n'"  'renamed.patch::fix.patch'"$'\n'"  'git+https://example.test/repo.git#commit=abc'"$'\n'")"
+  printf '%s\n' 'diff --git a/a b/a' '+ suspicious patch context' > "$dir/fix.patch"
+  write_openai_response "$(make_verdict)" "$dir/response.json"
+
+  OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null
+  jq -e '.input[].content | select(contains("Package sidecar file (local source): fix.patch") and contains("suspicious patch context"))' "$dir/payload.json" >/dev/null
+}
+
+test_top_level_hook_in_payload() {
+  local dir="$TEST_ROOT/top-level-hook"
+  setup_case "$dir"
+  write_pkgbuild "$dir" 'pkgname=top-level-hook'
+  printf '%s\n' '[Action]' 'When = PostTransaction' 'Exec = /usr/bin/sh -c id' > "$dir/scanpkg-test.hook"
+  write_openai_response "$(make_verdict)" "$dir/response.json"
+
+  OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null
+  jq -e '.input[].content | select(contains("Package sidecar file (top-level high-risk file): scanpkg-test.hook") and contains("Exec = /usr/bin/sh -c id"))' "$dir/payload.json" >/dev/null
+}
+
 test_committed_diff_in_payload() {
   local dir="$TEST_ROOT/diff"
   setup_case "$dir"
@@ -332,6 +390,8 @@ test_store_false() {
   jq -e '.store == false' "$dir/payload.json" >/dev/null
   jq -e '.text.format.schema.required | index("network_fetch_in_build") | not' "$dir/payload.json" >/dev/null
   jq -e '.text.format.schema.properties | has("network_fetch_in_build") | not' "$dir/payload.json" >/dev/null
+  jq -e '.text.format.schema.required | index("package_hook_suspicious")' "$dir/payload.json" >/dev/null
+  jq -e '.text.format.schema.required | index("sidecar_file_suspicious")' "$dir/payload.json" >/dev/null
 }
 
 test_cached_response_reused_for_same_version() {
@@ -347,7 +407,7 @@ test_cached_response_reused_for_same_version() {
 
   [[ "$(sed -n '1p' "$dir/curl.count")" == "1" ]]
   grep -qx -- '--cached' "$dir/makepkg.args"
-  jq -e '.version == "1.0-1" and (.response | type == "object")' "$dir/cache/cache-pkg.lock" >/dev/null
+  jq -e '.version == "1.0-1" and .schema_version == 2 and (.response | type == "object")' "$dir/cache/cache-pkg.lock" >/dev/null
 }
 
 test_cache_version_mismatch_refreshes() {
@@ -421,6 +481,11 @@ run_test 'missing API key blocks' test_missing_api_key_blocks
 run_test 'single install script included' test_single_install_in_payload
 run_test 'multiple install scripts included' test_multiple_installs_in_payload
 run_test 'missing install script warning included' test_missing_install_warning
+run_test 'variable install script included' test_variable_install_in_payload
+run_test 'changelog included' test_changelog_in_payload
+run_test 'missing changelog warning included' test_missing_changelog_warning
+run_test 'local source patch included' test_local_source_patch_in_payload
+run_test 'top-level hook included' test_top_level_hook_in_payload
 run_test 'committed diff included' test_committed_diff_in_payload
 run_test 'new author signal included' test_new_author_signal
 run_test 'store false included' test_store_false

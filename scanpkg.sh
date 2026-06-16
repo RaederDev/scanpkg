@@ -21,7 +21,7 @@ OPENAI_REASONING_EFFORT="${OPENAI_REASONING_EFFORT:-medium}"
 OPENAI_STORE="${OPENAI_STORE:-false}"
 
 RISK_ABORT_THRESHOLD="${RISK_ABORT_THRESHOLD:-2}"
-CRITICAL_RISK_KEYS="${CRITICAL_RISK_KEYS:-malware_suspected credential_exfiltration destructive_behavior obfuscated_payload install_script_suspicious new_runtime_or_toolchain}"
+CRITICAL_RISK_KEYS="${CRITICAL_RISK_KEYS:-malware_suspected credential_exfiltration destructive_behavior obfuscated_payload install_script_suspicious package_hook_suspicious sidecar_file_suspicious new_runtime_or_toolchain}"
 SCANPKG_ALLOW_FAILED_PACKAGES="${SCANPKG_ALLOW_FAILED_PACKAGES:-}"
 FAIL_CLOSED="${FAIL_CLOSED:-1}"
 
@@ -31,8 +31,9 @@ MAX_CONTEXT_BYTES="${MAX_CONTEXT_BYTES:-250000}"
 CACHE_DIR="${SCANPKG_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-}/.cache}/scanpkg}"
 CACHE_TTL_SECONDS="${SCANPKG_CACHE_TTL_SECONDS:-3600}"
 VERBOSE="${VERBOSE:-1}"
+CACHE_SCHEMA_VERSION=2
 
-SYSTEM_PROMPT="${SYSTEM_PROMPT:-You review Arch Linux PKGBUILD files for malware risk. Return only the requested JSON. Treat as suspicious: obfuscated shell, credential access or exfiltration, destructive commands outside build dirs, checksum bypasses, suspicious source URL changes, newly added install scripts, install hooks that run commands as root, and random introduction of runtimes/toolchains such as node/npm/npx/yarn/pnpm/bun/deno/go/cargo/python/pip/ruby when not previously present. A new recent author is a risk signal when paired with suspicious changes. Prefer blocking only when evidence is concrete.}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-You review Arch Linux PKGBUILD files for malware risk. Return only the requested JSON. Treat as suspicious: obfuscated shell, credential access or exfiltration, destructive commands outside build dirs, checksum bypasses, suspicious source URL changes, newly added install scripts, ALPM hooks, systemd units, udev rules, sudoers or polkit policy snippets, profile/cron/autostart files, local patches or helper scripts with unexpected behavior, and random introduction of runtimes/toolchains such as node/npm/npx/yarn/pnpm/bun/deno/go/cargo/python/pip/ruby when not previously present. A new recent author is a risk signal when paired with suspicious changes. Prefer blocking only when evidence is concrete.}"
 
 RISK_KEYS=(
   malware_suspected
@@ -42,6 +43,8 @@ RISK_KEYS=(
   new_runtime_or_toolchain
   new_install_script
   install_script_suspicious
+  package_hook_suspicious
+  sidecar_file_suspicious
   new_or_unusual_author
   checksum_or_source_suspicious
 )
@@ -57,6 +60,10 @@ TOTAL_CONTEXT_BYTES=0
 MAKEPKG_ARGS=()
 PACKAGE_NAMES=()
 PACKAGE_VERSION=""
+SIDECAR_PATHS=()
+SIDECAR_KINDS=()
+SIDECAR_REASONS=()
+SIDECAR_EXPLICIT=()
 
 cleanup_files=()
 
@@ -330,9 +337,11 @@ load_cached_response() {
 
     if jq -e \
       --arg version "$PACKAGE_VERSION" \
+      --argjson schema_version "$CACHE_SCHEMA_VERSION" \
       --argjson now "$now" \
       --argjson ttl "$CACHE_TTL_SECONDS" \
       '.version == $version and
+       .schema_version == $schema_version and
        (.cached_at | type == "number") and
        (($now - .cached_at) <= $ttl) and
        (.response | type == "object")' \
@@ -367,11 +376,13 @@ store_cached_response() {
     if jq -n \
       --arg package_name "$package_name" \
       --arg version "$PACKAGE_VERSION" \
+      --argjson schema_version "$CACHE_SCHEMA_VERSION" \
       --argjson cached_at "$now" \
       --argjson response "$response_json" \
       '{
         package_name: $package_name,
         version: $version,
+        schema_version: $schema_version,
         cached_at: $cached_at,
         response: $response
       }' > "$tmp_file" 2>/dev/null; then
@@ -429,54 +440,407 @@ print_allowlist_instructions() {
   printf 'scanpkg: or add SCANPKG_ALLOW_FAILED_PACKAGES="%s" to %s for this wrapper.\n' "$package_names" "$ENV_FILE" >&2
 }
 
-collect_install_scripts() {
+strip_shell_comment() {
+  local line="$1"
+  local out=""
+  local ch
+  local i
+  local in_single=0
+  local in_double=0
+  local escaped=0
+
+  for ((i = 0; i < ${#line}; i++)); do
+    ch="${line:i:1}"
+    if (( escaped )); then
+      out+="$ch"
+      escaped=0
+      continue
+    fi
+    if [[ "$ch" == "\\" && $in_single -eq 0 ]]; then
+      out+="$ch"
+      escaped=1
+      continue
+    fi
+    if [[ "$ch" == "'" && $in_double -eq 0 ]]; then
+      (( in_single )) && in_single=0 || in_single=1
+      out+="$ch"
+      continue
+    fi
+    if [[ "$ch" == '"' && $in_single -eq 0 ]]; then
+      (( in_double )) && in_double=0 || in_double=1
+      out+="$ch"
+      continue
+    fi
+    if [[ "$ch" == "#" && $in_single -eq 0 && $in_double -eq 0 ]]; then
+      if [[ -z "$out" || "${out: -1}" =~ [[:space:]] ]]; then
+        break
+      fi
+    fi
+    out+="$ch"
+  done
+
+  printf '%s' "$out"
+}
+
+shell_words() {
+  local text="$1"
+  local token=""
+  local ch
+  local i
+  local in_single=0
+  local in_double=0
+  local escaped=0
+
+  for ((i = 0; i < ${#text}; i++)); do
+    ch="${text:i:1}"
+    if (( escaped )); then
+      token+="$ch"
+      escaped=0
+      continue
+    fi
+    if [[ "$ch" == "\\" && $in_single -eq 0 ]]; then
+      escaped=1
+      continue
+    fi
+    if [[ "$ch" == "'" && $in_double -eq 0 ]]; then
+      (( in_single )) && in_single=0 || in_single=1
+      continue
+    fi
+    if [[ "$ch" == '"' && $in_single -eq 0 ]]; then
+      (( in_double )) && in_double=0 || in_double=1
+      continue
+    fi
+    if [[ $in_single -eq 0 && $in_double -eq 0 && "$ch" =~ [[:space:]\;] ]]; then
+      if [[ -n "$token" ]]; then
+        printf '%s\n' "$token"
+        token=""
+      fi
+      continue
+    fi
+    token+="$ch"
+  done
+
+  [[ -n "$token" ]] && printf '%s\n' "$token"
+}
+
+collect_static_pkgbuild_vars() {
   local line
-  local trimmed
   local without_comment
-  local rest
-  local match
+  local key
+  local rhs
   local value
-  local scripts=()
-  local script
-  local content
+
+  declare -gA STATIC_PKGBUILD_VARS=()
+
+  if (( ${#PACKAGE_NAMES[@]} > 0 )); then
+    STATIC_PKGBUILD_VARS[pkgname]="${PACKAGE_NAMES[0]}"
+    STATIC_PKGBUILD_VARS[pkgbase]="${PACKAGE_NAMES[0]}"
+  fi
 
   while IFS= read -r line || [[ -n "$line" ]]; do
-    trimmed="${line#"${line%%[![:space:]]*}"}"
-    [[ "$trimmed" == \#* ]] && continue
-
-    without_comment="${line%%#*}"
-    rest="$without_comment"
-
-    while [[ "$rest" =~ (^|[[:space:];])install[[:space:]]*=[[:space:]]*([^[:space:];]+) ]]; do
-      match="${BASH_REMATCH[0]}"
-      value="${BASH_REMATCH[2]}"
-      value="$(strip_outer_quotes "$value")"
-
-      if [[ -n "$value" ]]; then
-        scripts+=("$value")
-      fi
-
-      rest="${rest#*"$match"}"
-    done
+    without_comment="$(strip_shell_comment "$line")"
+    if [[ "$without_comment" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      rhs="${BASH_REMATCH[2]}"
+      rhs="${rhs#"${rhs%%[![:space:]]*}"}"
+      [[ "$rhs" == \(* ]] && continue
+      value="$(shell_words "$rhs" | sed -n '1p')"
+      [[ -z "$value" || "$value" == *'$'* || "$value" == *'`'* || "$value" == *'('* ]] && continue
+      STATIC_PKGBUILD_VARS["$key"]="$value"
+    fi
   done < PKGBUILD
+}
 
-  if (( ${#scripts[@]} == 0 )); then
-    add_user_message "PKGBUILD install scripts" "no install= scripts referenced"
+resolve_static_value() {
+  local value="$1"
+  local var
+
+  while [[ "$value" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+    var="${BASH_REMATCH[1]}"
+    [[ -n "${STATIC_PKGBUILD_VARS[$var]+set}" ]] || break
+    value="${value//\$\{$var\}/${STATIC_PKGBUILD_VARS[$var]}}"
+  done
+  while [[ "$value" =~ \$([A-Za-z_][A-Za-z0-9_]*) ]]; do
+    var="${BASH_REMATCH[1]}"
+    [[ -n "${STATIC_PKGBUILD_VARS[$var]+set}" ]] || break
+    value="${value//\$$var/${STATIC_PKGBUILD_VARS[$var]}}"
+  done
+
+  printf '%s' "$value"
+}
+
+normalize_local_path() {
+  local path="$1"
+
+  path="${path#./}"
+  if [[ -z "$path" || "$path" == /* || "$path" == ".." || "$path" == ../* || "$path" == */../* || "$path" == *'?'* || "$path" == *'*'* || "$path" == *'['* ]]; then
+    return 1
+  fi
+  printf '%s' "$path"
+}
+
+is_remote_source() {
+  local source="$1"
+
+  [[ "$source" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]] && return 0
+  [[ "$source" =~ ^(bzr|fossil|git|hg|svn)\+ ]] && return 0
+  [[ "$source" == git@*:* ]] && return 0
+  return 1
+}
+
+has_shebang() {
+  local path="$1"
+  local first_line=""
+
+  [[ -f "$path" ]] || return 1
+  IFS= read -r first_line < "$path" || true
+  [[ "$first_line" == '#!'* ]]
+}
+
+is_high_risk_local_file() {
+  local path="$1"
+  local lower
+  local base
+
+  lower="${path,,}"
+  base="$(basename -- "$lower")"
+  case "$base" in
+    *.install|*.hook|*.service|*.socket|*.timer|*.path|*.mount|*.automount|*.rules|*.desktop|*.patch|*.diff|*.sh|*.bash|*.zsh|*.fish|*.py|*.pl|*.rb|*.lua|*.js|*.mjs|*.cjs|*.conf|*.sysusers|*.tmpfiles)
+      return 0
+      ;;
+  esac
+  case "$lower" in
+    *sudoers*|*polkit*|*cron*|*profile*|*autostart*|*tmpfiles*|*sysusers*)
+      return 0
+      ;;
+  esac
+  has_shebang "$path"
+}
+
+add_sidecar_candidate() {
+  local path="$1"
+  local kind="$2"
+  local reason="$3"
+  local explicit="${4:-1}"
+  local normalized
+
+  if ! normalized="$(normalize_local_path "$path")"; then
+    if [[ "$explicit" == "1" ]]; then
+      add_user_message "Unsafe package sidecar reference: ${path}" "WARNING: ${reason} references ${path}, which is outside the package directory or contains an unsupported glob. The file was not read."
+    fi
     return 0
   fi
 
-  declare -A seen=()
-  for script in "${scripts[@]}"; do
-    [[ -n "${seen[$script]+set}" ]] && continue
-    seen["$script"]=1
+  SIDECAR_PATHS+=("$normalized")
+  SIDECAR_KINDS+=("$kind")
+  SIDECAR_REASONS+=("$reason")
+  SIDECAR_EXPLICIT+=("$explicit")
+}
 
-    if [[ -f "$script" ]]; then
-      content="$(read_file_or_empty "$script")"
-      add_user_message "Install script: ${script}" "$content"
+parse_sidecar_assignment_line() {
+  local rest="$1"
+  local match
+  local key
+  local raw
+  local value
+
+  while [[ "$rest" =~ (^|[[:space:];])(install|changelog)[[:space:]]*=[[:space:]]*([^[:space:];]+) ]]; do
+    match="${BASH_REMATCH[0]}"
+    key="${BASH_REMATCH[2]}"
+    raw="${BASH_REMATCH[3]}"
+    value="$(strip_outer_quotes "$raw")"
+    value="$(resolve_static_value "$value")"
+
+    if [[ "$value" == *'$'* ]]; then
+      add_user_message "Unresolved package sidecar reference: ${key}" "WARNING: ${key}= uses a dynamic value (${raw}) that scanpkg could not statically resolve."
+    elif [[ -n "$value" ]]; then
+      add_sidecar_candidate "$value" "$key" "PKGBUILD ${key}="
+    fi
+    rest="${rest#*"$match"}"
+  done
+}
+
+parse_source_tokens() {
+  local source_body="$1"
+  local source_key="$2"
+  local token
+  local value
+  local actual
+
+  while IFS= read -r token || [[ -n "$token" ]]; do
+    value="$(resolve_static_value "$token")"
+    if [[ "$value" == *'$'* ]]; then
+      if [[ "$value" =~ \.(install|hook|service|socket|timer|path|mount|automount|rules|desktop|patch|diff|sh|bash|zsh|fish|py|pl|rb|lua|js|mjs|cjs|conf|sysusers|tmpfiles)($|[[:space:]]) ]]; then
+        add_user_message "Unresolved local source reference" "WARNING: ${source_key} contains a dynamic high-risk-looking source (${token}) that scanpkg could not statically resolve."
+      fi
+      continue
+    fi
+
+    actual="${value##*::}"
+    is_remote_source "$actual" && continue
+    if is_high_risk_local_file "$actual"; then
+      add_sidecar_candidate "$actual" "local source" "PKGBUILD ${source_key}"
+    fi
+  done < <(shell_words "$source_body")
+}
+
+parse_source_assignments() {
+  local line="$1"
+  local key
+  local body
+  local scalar
+
+  if [[ "$line" =~ ^[[:space:]]*(source(_[A-Za-z0-9_]+)?)[[:space:]]*=[[:space:]]*\((.*)$ ]]; then
+    key="${BASH_REMATCH[1]}"
+    body="${BASH_REMATCH[3]}"
+    body="${body%%)*}"
+    parse_source_tokens "$body" "$key"
+  elif [[ "$line" =~ (^|[[:space:];])(source(_[A-Za-z0-9_]+)?)[[:space:]]*=[[:space:]]*([^[:space:];]+) ]]; then
+    key="${BASH_REMATCH[2]}"
+    scalar="${BASH_REMATCH[4]}"
+    [[ "$scalar" == \(* ]] && return 0
+    parse_source_tokens "$scalar" "$key"
+  fi
+}
+
+collect_top_level_high_risk_files() {
+  local file
+
+  while IFS= read -r file || [[ -n "$file" ]]; do
+    [[ "$file" == "PKGBUILD" || "$file" == ".SRCINFO" ]] && continue
+    if is_high_risk_local_file "$file"; then
+      add_sidecar_candidate "$file" "top-level high-risk file" "top-level package file" 0
+    fi
+  done < <(find . -maxdepth 1 -type f -printf '%P\n' 2>/dev/null)
+}
+
+collect_sidecar_history() {
+  local path="$1"
+  local label="$2"
+  local status_output
+  local commits=()
+  local diff_output
+
+  status_output="$(git status --porcelain -- "$path" 2>/dev/null)"
+  if [[ -n "$status_output" ]]; then
+    add_user_message "Git status for package sidecar: ${path}" "$status_output"
+  fi
+
+  mapfile -t commits < <(git log --follow --format=%H -- "$path" 2>/dev/null | head -n 2)
+  if (( ${#commits[@]} >= 2 )); then
+    diff_output="$(git diff "${commits[1]}" "${commits[0]}" -- "$path" 2>&1)"
+    add_user_message "Committed ${label} diff between latest two versions: ${path}" "$diff_output"
+  elif (( ${#commits[@]} == 1 )); then
+    diff_output="$(git show --format= -- "$path" 2>&1)"
+    add_user_message "Only committed ${label} version: ${path}" "$diff_output"
+  fi
+}
+
+file_is_text_like() {
+  local path="$1"
+
+  [[ ! -s "$path" ]] && return 0
+  LC_ALL=C grep -Iq . "$path"
+}
+
+collect_package_sidecars() {
+  local line
+  local without_comment
+  local path
+  local kind
+  local reason
+  local explicit
+  local content
+  local i
+  local in_source_array=0
+  local source_key=""
+  local source_body=""
+  local fragment
+  local install_count=0
+  declare -A seen=()
+
+  SIDECAR_PATHS=()
+  SIDECAR_KINDS=()
+  SIDECAR_REASONS=()
+  SIDECAR_EXPLICIT=()
+
+  collect_static_pkgbuild_vars
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    without_comment="$(strip_shell_comment "$line")"
+
+    if (( in_source_array )); then
+      fragment="$without_comment"
+      if [[ "$fragment" == *")"* ]]; then
+        source_body+=$'\n'"${fragment%%)*}"
+        parse_source_tokens "$source_body" "$source_key"
+        in_source_array=0
+        source_key=""
+        source_body=""
+      else
+        source_body+=$'\n'"$fragment"
+      fi
+      continue
+    fi
+
+    parse_sidecar_assignment_line "$without_comment"
+    if [[ "$without_comment" =~ ^[[:space:]]*(source(_[A-Za-z0-9_]+)?)[[:space:]]*=[[:space:]]*\((.*)$ ]]; then
+      source_key="${BASH_REMATCH[1]}"
+      fragment="${BASH_REMATCH[3]}"
+      if [[ "$fragment" == *")"* ]]; then
+        source_body="${fragment%%)*}"
+        parse_source_tokens "$source_body" "$source_key"
+        source_key=""
+        source_body=""
+      else
+        in_source_array=1
+        source_body="$fragment"
+      fi
     else
-      add_user_message "Missing install script: ${script}" "WARNING: PKGBUILD references install=${script}, but the file was not found in the current directory."
+      parse_source_assignments "$without_comment"
+    fi
+  done < PKGBUILD
+
+  collect_top_level_high_risk_files
+
+  if (( ${#SIDECAR_PATHS[@]} == 0 )); then
+    add_user_message "PKGBUILD package sidecars" "no install=, changelog=, or high-risk local source files found"
+    return 0
+  fi
+
+  for i in "${!SIDECAR_PATHS[@]}"; do
+    path="${SIDECAR_PATHS[$i]}"
+    kind="${SIDECAR_KINDS[$i]}"
+    reason="${SIDECAR_REASONS[$i]}"
+    explicit="${SIDECAR_EXPLICIT[$i]}"
+    [[ -n "${seen[$path]+set}" ]] && continue
+    seen["$path"]=1
+    [[ "$kind" == "install" ]] && install_count=$((install_count + 1))
+
+    if [[ -f "$path" ]]; then
+      if file_is_text_like "$path"; then
+        content="$(read_file_or_empty "$path")"
+        if [[ "$kind" == "install" ]]; then
+          add_user_message "Install script: ${path}" "Referenced by: ${reason}"$'\n\n'"${content}"
+        else
+          add_user_message "Package sidecar file (${kind}): ${path}" "Referenced by: ${reason}"$'\n\n'"${content}"
+        fi
+      else
+        add_user_message "Skipped binary package sidecar file (${kind}): ${path}" "Referenced by: ${reason}"$'\n\n''scanpkg did not include file contents because the file does not appear to be text.'
+      fi
+      collect_sidecar_history "$path" "$kind"
+    elif [[ "$explicit" == "1" ]]; then
+      if [[ "$kind" == "install" ]]; then
+        add_user_message "Missing install script: ${path}" "WARNING: ${reason} references ${path}, but the file was not found in the current directory."
+      else
+        add_user_message "Missing package sidecar file (${kind}): ${path}" "WARNING: ${reason} references ${path}, but the file was not found in the current directory."
+      fi
     fi
   done
+
+  if (( install_count == 0 )); then
+    add_user_message "PKGBUILD install scripts" "no install= scripts referenced"
+  fi
 }
 
 risk_keys_json() {
@@ -505,6 +869,8 @@ build_request_json() {
         "new_runtime_or_toolchain",
         "new_install_script",
         "install_script_suspicious",
+        "package_hook_suspicious",
+        "sidecar_file_suspicious",
         "new_or_unusual_author",
         "checksum_or_source_suspicious",
         "summary",
@@ -518,6 +884,8 @@ build_request_json() {
         new_runtime_or_toolchain: {type: "boolean"},
         new_install_script: {type: "boolean"},
         install_script_suspicious: {type: "boolean"},
+        package_hook_suspicious: {type: "boolean"},
+        sidecar_file_suspicious: {type: "boolean"},
         new_or_unusual_author: {type: "boolean"},
         checksum_or_source_suspicious: {type: "boolean"},
         summary: {type: "string"},
@@ -715,7 +1083,7 @@ main() {
   collect_pkgbuild_history
   collect_worktree_diff
   collect_authors
-  collect_install_scripts
+  collect_package_sidecars
 
   if ! response_json="$(load_cached_response)"; then
     request_json="$(build_request_json)" || scanner_failed "failed to build OpenAI request"
