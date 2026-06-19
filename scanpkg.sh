@@ -55,7 +55,7 @@ REQUIRED_KEYS=(
   evidence
 )
 
-INPUT_JSON="[]"
+INPUT_JSON_FILE=""
 TOTAL_CONTEXT_BYTES=0
 MAKEPKG_ARGS=()
 PACKAGE_NAMES=()
@@ -116,15 +116,25 @@ verbose_log() {
   printf 'scanpkg: %s\n' "$1" >&2
 }
 
+init_input_json() {
+  INPUT_JSON_FILE="$(mktemp)"
+  cleanup_files+=("$INPUT_JSON_FILE")
+  printf '[]' > "$INPUT_JSON_FILE" || scanner_failed "failed to initialize OpenAI input JSON"
+}
+
 add_user_message() {
   local title="$1"
   local body="$2"
   local content
   local remaining
+  local content_file
+  local next_input_file
 
   if (( TOTAL_CONTEXT_BYTES >= MAX_CONTEXT_BYTES )); then
     return 0
   fi
+
+  [[ -n "$INPUT_JSON_FILE" ]] || scanner_failed "OpenAI input JSON was not initialized"
 
   content="## ${title}"$'\n\n'"${body}"
   remaining=$((MAX_CONTEXT_BYTES - TOTAL_CONTEXT_BYTES))
@@ -134,8 +144,16 @@ add_user_message() {
   fi
 
   TOTAL_CONTEXT_BYTES=$((TOTAL_CONTEXT_BYTES + ${#content}))
-  INPUT_JSON="$(jq -c --arg content "$content" '. + [{"role":"user","content":$content}]' <<<"$INPUT_JSON")" \
-    || scanner_failed "failed to build OpenAI input JSON"
+  content_file="$(mktemp)"
+  next_input_file="$(mktemp)"
+  cleanup_files+=("$content_file" "$next_input_file")
+
+  printf '%s' "$content" > "$content_file" || scanner_failed "failed to write OpenAI input content"
+  if jq -c --rawfile content "$content_file" '. + [{"role":"user","content":$content}]' "$INPUT_JSON_FILE" > "$next_input_file"; then
+    mv -f "$next_input_file" "$INPUT_JSON_FILE" || scanner_failed "failed to update OpenAI input JSON"
+  else
+    scanner_failed "failed to build OpenAI input JSON"
+  fi
 }
 
 read_file_or_empty() {
@@ -899,14 +917,14 @@ build_request_json() {
     --arg instructions "$SYSTEM_PROMPT" \
     --arg effort "$OPENAI_REASONING_EFFORT" \
     --argjson store "$store_bool" \
-    --argjson input "$INPUT_JSON" \
+    --slurpfile input "$INPUT_JSON_FILE" \
     --argjson schema "$risk_schema" \
     '{
       model: $model,
       store: $store,
       reasoning: {effort: $effort},
       instructions: $instructions,
-      input: $input,
+      input: $input[0],
       text: {
         format: {
           type: "json_schema",
@@ -1076,6 +1094,7 @@ main() {
 
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || scanner_failed "current directory is not inside a git worktree"
 
+  init_input_json
   collect_package_names
   collect_package_version
   pkgbuild_content="$(read_file_or_empty PKGBUILD)"
