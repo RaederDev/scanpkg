@@ -4,6 +4,8 @@
 
 If the verdict crosses the configured risk threshold, the build is blocked. Otherwise, `scanpkg` executes the real `makepkg` with the original arguments.
 
+Before consulting the model or a cached verdict, `scanpkg` also blocks ELF binaries newly added by the latest commit, the index/worktree, or as untracked package files.
+
 ## Requirements
 
 - Arch Linux or an Arch-based system
@@ -30,7 +32,7 @@ Create a local config file next to `scanpkg.sh`:
 ```bash
 cat > ~/.local/share/scanpkg/.env <<'EOF'
 OPENAI_API_KEY=your_api_key_here
-OPENAI_MODEL=gpt-5.4
+OPENAI_MODEL=gpt-5.6-terra
 MAKEPKG_BIN=/usr/bin/makepkg
 EOF
 ```
@@ -85,7 +87,7 @@ Common environment variables:
 
 ```bash
 OPENAI_API_KEY=your_api_key_here
-OPENAI_MODEL=gpt-5.4
+OPENAI_MODEL=gpt-5.6-terra
 MAKEPKG_BIN=/usr/bin/makepkg
 RISK_ABORT_THRESHOLD=2
 FAIL_CLOSED=1
@@ -101,7 +103,7 @@ Useful controls:
 - `RISK_ABORT_THRESHOLD`: number of risk flags needed to block when no critical flag is triggered.
 - `CRITICAL_RISK_KEYS`: space-separated risk keys that always block when true.
 - `FAIL_CLOSED`: set to `0` to continue with `makepkg` if scanning fails.
-- `SCANPKG_ALLOW_FAILED_PACKAGES`: temporary allowlist for blocked package names.
+- `SCANPKG_ALLOW_FAILED_PACKAGES`: temporary allowlist for blocked package names, including packages with newly added ELF binaries.
 - `SCANPKG_CACHE_TTL_SECONDS`: how long to reuse a cached scan result for the same package version.
 - `VERBOSE`: set to `0` to reduce request/response logging.
 
