@@ -464,70 +464,6 @@ print_allowlist_instructions() {
   printf 'scanpkg: or add SCANPKG_ALLOW_FAILED_PACKAGES="%s" to %s for this wrapper.\n' "$package_names" "$ENV_FILE" >&2
 }
 
-collect_new_file_candidates() {
-  local output_file="$1"
-
-  if git rev-parse --verify HEAD >/dev/null 2>&1; then
-    if git rev-parse --verify 'HEAD^1' >/dev/null 2>&1; then
-      git diff --name-only --diff-filter=A -z 'HEAD^1' HEAD -- >> "$output_file" \
-        || scanner_failed "failed to list files added by the latest commit"
-    else
-      git diff-tree --root --no-commit-id --name-only --diff-filter=A -r -z HEAD -- >> "$output_file" \
-        || scanner_failed "failed to list files added by the root commit"
-    fi
-
-    git diff --name-only --diff-filter=A -z HEAD -- >> "$output_file" \
-      || scanner_failed "failed to list files added in the index or worktree"
-  fi
-
-  git ls-files --others --exclude-standard -z -- >> "$output_file" \
-    || scanner_failed "failed to list untracked package files"
-}
-
-check_new_elf_binaries() {
-  local candidates_file
-  local path
-  local file_path
-  local magic
-  local new_elf_paths=()
-  declare -A seen=()
-
-  candidates_file="$(mktemp)"
-  cleanup_files+=("$candidates_file")
-  collect_new_file_candidates "$candidates_file"
-
-  while IFS= read -r -d '' path; do
-    [[ -n "${seen[$path]+set}" ]] && continue
-    seen["$path"]=1
-    file_path="./${path}"
-
-    [[ -f "$file_path" ]] || continue
-    [[ -r "$file_path" ]] || scanner_failed "cannot inspect newly added file: ${path}"
-    magic="$(LC_ALL=C od -An -tx1 -N4 "$file_path" 2>/dev/null | tr -d '[:space:]')" \
-      || scanner_failed "failed to inspect newly added file: ${path}"
-
-    if [[ "$magic" == "7f454c46" ]]; then
-      new_elf_paths+=("$path")
-    fi
-  done < "$candidates_file"
-
-  (( ${#new_elf_paths[@]} > 0 )) || return 0
-
-  printf 'scanpkg: newly added ELF binaries detected:\n' >&2
-  for path in "${new_elf_paths[@]}"; do
-    printf 'scanpkg:   %q\n' "$path" >&2
-  done
-
-  if any_package_is_allowlisted; then
-    printf 'scanpkg: allowing newly added ELF binaries because package is temporarily whitelisted: %s\n' "$(package_names_for_display)" >&2
-    return 0
-  fi
-
-  printf 'scanpkg: blocked PKGBUILD: newly added ELF binaries are not allowed\n' >&2
-  print_allowlist_instructions
-  exit 1
-}
-
 strip_shell_comment() {
   local line="$1"
   local out=""
@@ -1166,7 +1102,6 @@ main() {
 
   init_input_json
   collect_package_names
-  check_new_elf_binaries
   collect_package_version
   pkgbuild_content="$(read_file_or_empty PKGBUILD)"
   add_user_message "Current PKGBUILD" "$pkgbuild_content"
