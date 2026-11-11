@@ -45,11 +45,13 @@ make_verdict() {
     --argjson checksum "${9:-false}" \
     --argjson hook "${10:-false}" \
     --argjson sidecar "${11:-false}" \
+    --argjson privilege "${12:-false}" \
     '{
       malware_suspected: $malware,
       credential_exfiltration: $credential,
       destructive_behavior: $destructive,
       obfuscated_payload: $obfuscated,
+      privilege_escalation_suspicious: $privilege,
       new_runtime_or_toolchain: $runtime,
       new_install_script: $new_install,
       install_script_suspicious: $install_suspicious,
@@ -251,6 +253,89 @@ test_single_noncritical_allows() {
   [[ -f "$dir/makepkg.args" ]]
 }
 
+test_privilege_escalation_blocks() {
+  local dir="$TEST_ROOT/privilege"
+  setup_case "$dir"
+  write_pkgbuild "$dir" 'pkgname=privilege'
+  write_openai_response "$(make_verdict false false false false false false false false false false false true)" "$dir/response.json"
+
+  if OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null 2>"$dir/stderr.log"; then
+    return 1
+  fi
+  grep -q 'Blocking findings:' "$dir/stderr.log"
+  grep -q 'Unexpected privilege escalation (privilege_escalation_suspicious)' "$dir/stderr.log"
+  [[ ! -f "$dir/makepkg.args" ]]
+}
+
+test_single_new_runtime_allows() {
+  local dir="$TEST_ROOT/new-runtime"
+  setup_case "$dir"
+  write_pkgbuild "$dir" 'pkgname=new-runtime'
+  write_openai_response "$(make_verdict false false false false true)" "$dir/response.json"
+
+  OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null
+  [[ -f "$dir/makepkg.args" ]]
+}
+
+test_new_runtime_with_source_signal_blocks() {
+  local dir="$TEST_ROOT/new-runtime-source"
+  setup_case "$dir"
+  write_pkgbuild "$dir" 'pkgname=new-runtime-source'
+  write_openai_response "$(make_verdict false false false false true false false false true)" "$dir/response.json"
+
+  if OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null 2>&1; then
+    return 1
+  fi
+  [[ ! -f "$dir/makepkg.args" ]]
+}
+
+test_multiline_pkgname_array() {
+  local dir="$TEST_ROOT/multiline-pkgname"
+  setup_case "$dir"
+  write_pkgbuild "$dir" "pkgbase=split"$'\n'"pkgname=("$'\n'"  split-one  # first"$'\n'"  'split-two'"$'\n'")"$'\n'"pkgver=1.0"$'\n'"pkgrel=1"
+  write_openai_response "$(make_verdict true)" "$dir/response.json"
+
+  if OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null 2>"$dir/stderr.log"; then
+    return 1
+  fi
+  grep -q 'SCANPKG_ALLOW_FAILED_PACKAGES="split-one split-two"' "$dir/stderr.log"
+  [[ -f "$dir/cache/split-one.lock" && -f "$dir/cache/split-two.lock" ]]
+  [[ ! -e "$dir/cache/_.lock" ]]
+}
+
+test_block_report_is_plain_text() {
+  local dir="$TEST_ROOT/block-report"
+  local verdict
+  setup_case "$dir"
+  write_pkgbuild "$dir" "pkgname=report-pkg"$'\n'"pkgver=2.0"$'\n'"pkgrel=1"
+  verdict="$(make_verdict false false false false true false false false true | jq -c '.summary = "Source moved to another account." | .evidence = ["PKGBUILD: source changed", "build(): npx -y helper"]')"
+  write_openai_response "$verdict" "$dir/response.json"
+
+  if SCANPKG_TEST_VERBOSE=1 OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null 2>"$dir/stderr.log"; then
+    return 1
+  fi
+  grep -q 'scanpkg: BLOCKED report-pkg 2.0-1' "$dir/stderr.log"
+  grep -qx '    Source moved to another account.' "$dir/stderr.log"
+  grep -q 'Signals (2 found, 2 or more block together):' "$dir/stderr.log"
+  grep -q '! Newly added runtime or toolchain (new_runtime_or_toolchain)' "$dir/stderr.log"
+  grep -qx '    - build(): npx -y helper' "$dir/stderr.log"
+  grep -q 'yay -S report-pkg' "$dir/stderr.log"
+  ! grep -q '"output"' "$dir/stderr.log"
+  ! grep -q 'OpenAI request body' "$dir/stderr.log"
+}
+
+test_pass_reports_signals() {
+  local dir="$TEST_ROOT/pass-report"
+  setup_case "$dir"
+  write_pkgbuild "$dir" 'pkgname=pass-report'
+  write_openai_response "$(make_verdict false false false false false false false false true)" "$dir/response.json"
+
+  OPENAI_API_KEY=test-key run_scan "$dir" >/dev/null 2>"$dir/stderr.log"
+  [[ -f "$dir/makepkg.args" ]]
+  grep -q 'scanpkg: passed pass-report with 1 signal(s) below the block threshold of 2' "$dir/stderr.log"
+  grep -q 'Checksum or source concern (checksum_or_source_suspicious)' "$dir/stderr.log"
+}
+
 test_missing_api_key_blocks() {
   local dir="$TEST_ROOT/no-key"
   setup_case "$dir"
@@ -278,8 +363,13 @@ test_default_model_and_hardened_prompt() {
       contains("sudo, su, pkexec") and
       contains("network-to-shell execution") and
       contains("maintainer impersonation") and
-      contains("truncated, missing, unresolved")
+      contains("truncated, missing, unresolved") and
+      contains("chrome-sandbox") and
+      contains("Change awareness") and
+      contains("SUID bits and capabilities are never destructive_behavior")
   ' "$dir/payload.json" >/dev/null
+  jq -e '.text.format.schema.properties | keys_unsorted | .[0:2] == ["evidence", "summary"]' "$dir/payload.json" >/dev/null
+  jq -e '.text.format.schema.required | index("privilege_escalation_suspicious")' "$dir/payload.json" >/dev/null
 }
 
 test_single_install_in_payload() {
@@ -426,7 +516,7 @@ test_cached_response_reused_for_same_version() {
 
   [[ "$(sed -n '1p' "$dir/curl.count")" == "1" ]]
   grep -qx -- '--cached' "$dir/makepkg.args"
-  jq -e '.version == "1.0-1" and .schema_version == 3 and (.response | type == "object")' "$dir/cache/cache-pkg.lock" >/dev/null
+  jq -e '.version == "1.0-1" and .schema_version == 4 and (.response | type == "object")' "$dir/cache/cache-pkg.lock" >/dev/null
 }
 
 test_old_cache_schema_refreshes() {
@@ -494,11 +584,11 @@ test_script_dir_env_and_verbose() {
   printf '%s\n' \
     'OPENAI_API_KEY=dotenv-key' \
     'OPENAI_MODEL=dotenv-model' \
-    'VERBOSE=1' > "$script_dir/.env"
+    'VERBOSE=2' > "$script_dir/.env"
 
   SCANPKG_TEST_SCRIPT="$script_dir/scanpkg.sh" SCANPKG_LOAD_ENV=1 OPENAI_API_KEY= run_scan "$dir" >/dev/null 2>"$dir/stderr.log"
   jq -e '.model == "dotenv-model"' "$dir/payload.json" >/dev/null
-  grep -q 'scanpkg: OpenAI request endpoint:' "$dir/stderr.log"
+  grep -q 'scanpkg: scanning with dotenv-model via' "$dir/stderr.log"
   grep -q 'scanpkg: OpenAI request body:' "$dir/stderr.log"
   grep -q 'scanpkg: OpenAI response body:' "$dir/stderr.log"
   grep -q '"model": "dotenv-model"' "$dir/stderr.log"
@@ -515,6 +605,12 @@ run_test 'rejected build prints allowlist instruction' test_reject_prints_allowl
 run_test 'allowlisted rejected build calls makepkg' test_allowlisted_rejection_calls_makepkg
 run_test 'threshold verdict blocks' test_threshold_blocks
 run_test 'single noncritical allows' test_single_noncritical_allows
+run_test 'privilege escalation verdict blocks' test_privilege_escalation_blocks
+run_test 'single new runtime allows' test_single_new_runtime_allows
+run_test 'new runtime plus source signal blocks' test_new_runtime_with_source_signal_blocks
+run_test 'multi-line pkgname array parsed' test_multiline_pkgname_array
+run_test 'block report is plain text' test_block_report_is_plain_text
+run_test 'pass reports signals below threshold' test_pass_reports_signals
 run_test 'missing API key blocks' test_missing_api_key_blocks
 run_test 'default model and hardened prompt included' test_default_model_and_hardened_prompt
 run_test 'single install script included' test_single_install_in_payload

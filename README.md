@@ -100,10 +100,24 @@ Useful controls:
 - `MAKEPKG_BIN`: real `makepkg` binary to execute after a clean scan.
 - `RISK_ABORT_THRESHOLD`: number of risk flags needed to block when no critical flag is triggered.
 - `CRITICAL_RISK_KEYS`: space-separated risk keys that always block when true.
+
+## Risk Keys
+
+The scanner returns evidence, a summary, and one boolean per risk key. By default these keys block on their own:
+
+- `malware_suspected`, `credential_exfiltration`, `destructive_behavior`, `obfuscated_payload`
+- `privilege_escalation_suspicious`: unexpected SUID/SGID, capabilities, sudoers/polkit, or build-time host writes
+- `install_script_suspicious`, `package_hook_suspicious`, `sidecar_file_suspicious`
+
+These are supply-chain signals that only block once `RISK_ABORT_THRESHOLD` (default 2) of them are true together:
+
+- `new_runtime_or_toolchain`, `new_install_script`, `new_or_unusual_author`, `checksum_or_source_suspicious`
+
+The prompt lists conventional packaging patterns that must not be flagged on their own. Examples are the SUID `chrome-sandbox` in Chromium/Electron packages, `setcap` on helpers the package ships, and units or hooks that only serve the package itself. The `new_*` keys only consider what the latest diff adds. To make a supply-chain signal block on its own, set `CRITICAL_RISK_KEYS` to the full list of keys you want, including that signal. The variable replaces the default list; it doesn't add to it.
 - `FAIL_CLOSED`: set to `0` to continue with `makepkg` if scanning fails.
 - `SCANPKG_ALLOW_FAILED_PACKAGES`: temporary allowlist for blocked package names.
 - `SCANPKG_CACHE_TTL_SECONDS`: how long to reuse a cached scan result for the same package version.
-- `VERBOSE`: set to `0` to reduce request/response logging.
+- `VERBOSE`: `1` (default) logs scan and cache status lines, `0` prints only the verdict, `2` also dumps the raw OpenAI request and response JSON for debugging.
 
 ## Temporary Allowlist
 
